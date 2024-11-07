@@ -89,26 +89,36 @@ def main():
         first_frame = st.session_state.frames[0]
         h, w = first_frame.shape[:2]
         
+        # 计算适合显示的尺寸
+        max_display_width = 800  # 最大显示宽度
+        display_scale = min(max_display_width / w, 1.0)  # 缩放比例
+        display_width = int(w * display_scale)
+        display_height = int(h * display_scale)
+        
+        # 调整第一帧大小用于显示
+        display_frame = cv2.resize(first_frame, (display_width, display_height))
+        
         # 创建画布让用户选择ROI
         canvas_result = st_canvas(
             fill_color="rgba(255, 165, 0, 0.3)",
             stroke_width=2,
             stroke_color="#00ff00",
-            background_image=Image.fromarray(cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)),
+            background_image=Image.fromarray(cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)),
             drawing_mode="rect",
             key="canvas",
-            width=w,
-            height=h,
+            width=display_width,
+            height=display_height,
         )
         
-        # 获取用户绘制的矩形
+        # 获取用户绘制的矩形并转换回原始尺寸
         if canvas_result.json_data is not None and len(canvas_result.json_data["objects"]) > 0:
             # 获取最后绘制的矩形
             rect = canvas_result.json_data["objects"][-1]
-            x = rect["left"]
-            y = rect["top"]
-            w = rect["width"]
-            h = rect["height"]
+            # 转换坐标到原始尺寸
+            x = int(rect["left"] / display_scale)
+            y = int(rect["top"] / display_scale)
+            w = int(rect["width"] / display_scale)
+            h = int(rect["height"] / display_scale)
             
             if st.button("确认选择并开始跟踪"):
                 # 创建进度条
@@ -152,14 +162,17 @@ def main():
                             (int(box[0]), int(box[1])), 
                             (int(box[0] + box[2]), int(box[1] + box[3])), 
                             (0, 255, 0), 2)
+                
+                # 调整显示大小
+                frame_with_result = cv2.resize(frame_with_result, (display_width, display_height))
                 st.image(frame_with_result, channels="BGR", use_container_width=True)
             
             with col2:
-                # 显示跟踪信息
+                # 显示跟踪信息（显示原始尺寸的坐标）
                 st.write("跟踪信息")
                 st.write(f"帧号: {frame_idx + 1}/{len(st.session_state.frames)}")
                 st.write(f"处理时间: {st.session_state.times[frame_idx]:.3f} 秒")
-                st.write("边界框坐标:")
+                st.write("边界框坐标 (原始尺寸):")
                 st.write(f"x: {box[0]:.1f}")
                 st.write(f"y: {box[1]:.1f}")
                 st.write(f"宽: {box[2]:.1f}")
