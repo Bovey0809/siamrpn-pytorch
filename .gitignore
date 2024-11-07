@@ -7,3 +7,5 @@ pretrained/
 data
 data/
 !.gitignore
+result/
+demo.mp4

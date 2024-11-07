@@ -1,4 +1,5 @@
 from __future__ import absolute_import, division
+import logging
 import time
 
 import torch
@@ -14,39 +15,38 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import matplotlib.colors as mcolors
 from PIL import Image
+from tqdm import tqdm
 
 
 fig_dict = {}
 patch_dict = {}
 
 
-def show_frame(image, boxes=None, fig_n=1, pause=0.001,
-               linewidth=3, cmap=None, colors=None, legends=None):
-    r"""Visualize an image w/o drawing rectangle(s).
+def save_frame(image, boxes=None, fig_n=1, linewidth=3, cmap=None, colors=None, legends=None, save_path='result'):
+    """Save an image with rectangle(s) drawn on it."""
+    # 确保保存目录存在
+    import os
+    os.makedirs(save_path, exist_ok=True)
     
-    Args:
-        image (numpy.ndarray or PIL.Image): Image to show.
-        boxes (numpy.array or a list of numpy.ndarray, optional): A 4 dimensional array
-            specifying rectangle [left, top, width, height] to draw, or a list of arrays
-            representing multiple rectangles. Default is ``None``.
-        fig_n (integer, optional): Figure ID. Default is 1.
-        pause (float, optional): Time delay for the plot. Default is 0.001 second.
-        linewidth (int, optional): Thickness for drawing the rectangle. Default is 3 pixels.
-        cmap (string): Color map. Default is None.
-        color (tuple): Color of drawed rectanlge. Default is None.
-    """
-    if isinstance(image, np.ndarray):
-        image = Image.fromarray(image[..., ::-1])
-
-    if not fig_n in fig_dict or \
-        fig_dict[fig_n].get_size() != image.size[::-1]:
-        fig = plt.figure(fig_n)
-        plt.axis('off')
-        fig.tight_layout()
-        fig_dict[fig_n] = plt.imshow(image, cmap=cmap)
+    # 如果是PIL图像，转换为numpy数组
+    if isinstance(image, Image.Image):
+        image = np.array(image)
+    
+    # 确保图像是BGR格式
+    if len(image.shape) == 3 and image.shape[2] == 3:
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     else:
-        fig_dict[fig_n].set_data(image)
+        image_rgb = image
 
+    # 创建新的图形
+    plt.figure(fig_n, figsize=(10, 10))
+    plt.axis('off')
+    plt.tight_layout()
+    
+    # 显示图像
+    plt.imshow(image_rgb)
+
+    # 绘制边界框
     if boxes is not None:
         if not isinstance(boxes, (list, tuple)):
             boxes = [boxes]
@@ -57,28 +57,24 @@ def show_frame(image, boxes=None, fig_n=1, pause=0.001,
         elif isinstance(colors, str):
             colors = [colors]
 
-        if not fig_n in patch_dict:
-            patch_dict[fig_n] = []
-            for i, box in enumerate(boxes):
-                patch_dict[fig_n].append(patches.Rectangle(
-                    (box[0], box[1]), box[2], box[3], linewidth=linewidth,
-                    edgecolor=colors[i % len(colors)], facecolor='none',
-                    alpha=0.7 if len(boxes) > 1 else 1.0))
-            for patch in patch_dict[fig_n]:
-                fig_dict[fig_n].axes.add_patch(patch)
-        else:
-            for patch, box in zip(patch_dict[fig_n], boxes):
-                patch.set_xy((box[0], box[1]))
-                patch.set_width(box[2])
-                patch.set_height(box[3])
+        # 为每个边界框创建一个矩形补丁
+        for i, box in enumerate(boxes):
+            rect = patches.Rectangle(
+                (box[0], box[1]), box[2], box[3],
+                linewidth=linewidth,
+                edgecolor=colors[i % len(colors)],
+                facecolor='none',
+                alpha=0.7 if len(boxes) > 1 else 1.0)
+            plt.gca().add_patch(rect)
         
         if legends is not None:
-            fig_dict[fig_n].axes.legend(
-                patch_dict[fig_n], legends, loc=1,
-                prop={'size': 8}, fancybox=True, framealpha=0.5)
+            plt.legend(legends, loc=1, prop={'size': 8}, 
+                      fancybox=True, framealpha=0.5)
 
-    plt.pause(pause)
-    plt.draw()
+    # 保存图像并关闭
+    plt.savefig(f'{save_path}/frame_{fig_n:04d}.png', 
+                bbox_inches='tight', pad_inches=0, dpi=100)
+    plt.close()
 
 
 class SiamRPN(nn.Module):
@@ -363,7 +359,8 @@ class TrackerSiamRPN(Tracker):
         boxes = np.zeros((frame_num, 4))
         boxes[0] = box
         times = np.zeros(frame_num)
-
+        logging.info(f"Tracking {frame_num} frames")
+        progress_bar = tqdm(total=len(imgs), desc="Tracking Progress")
         for f, img in enumerate(imgs):
             start_time = time.time()
             if f == 0:
@@ -373,6 +370,9 @@ class TrackerSiamRPN(Tracker):
             times[f] = time.time() - start_time
 
             if visualize:
-                show_frame(img, boxes[f, :])
+                save_frame(img, boxes[f, :], fig_n=f+1)
+            
+            progress_bar.update(1)
+        progress_bar.close()
 
         return boxes, times
