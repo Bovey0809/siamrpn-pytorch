@@ -154,6 +154,12 @@ class TrackerSiamRPN(Tracker):
                 net_path, map_location=lambda storage, loc: storage))
         self.net = self.net.to(self.device)
 
+        # 新增参数
+        self.top_k = 5  # 保存前K个候选框
+        self.response_threshold = 0.5  # 响应阈值
+        self.search_window = 1.5  # 搜索窗口扩展系数
+        self.history_candidates = []  # 历史候选框列表
+
     def parse_args(self, **kargs):
         self.cfg = {
             'exemplar_sz': 127,
@@ -219,63 +225,131 @@ class TrackerSiamRPN(Tracker):
     def update(self, image):
         image = np.asarray(image)
         
-        # search image
+        # 原有的搜索图像处理代码
         instance_image = self._crop_and_resize(
             image, self.center, self.x_sz,
             self.cfg.instance_sz, self.avg_color)
 
-        # classification and regression outputs
         instance_image = torch.from_numpy(instance_image).to(
             self.device).permute(2, 0, 1).unsqueeze(0).float()
+        
         with torch.set_grad_enabled(False):
             self.net.eval()
             out_reg, out_cls = self.net.inference(
                 instance_image, self.kernel_reg, self.kernel_cls)
         
-        # offsets
-        offsets = out_reg.permute(
-            1, 2, 3, 0).contiguous().view(4, -1).cpu().numpy()
+        # 计算所有候选框的响应值和位置
+        offsets = out_reg.permute(1, 2, 3, 0).contiguous().view(4, -1).cpu().numpy()
         offsets[0] = offsets[0] * self.anchors[:, 2] + self.anchors[:, 0]
         offsets[1] = offsets[1] * self.anchors[:, 3] + self.anchors[:, 1]
         offsets[2] = np.exp(offsets[2]) * self.anchors[:, 2]
         offsets[3] = np.exp(offsets[3]) * self.anchors[:, 3]
-
-        # scale and ratio penalty
-        penalty = self._create_penalty(self.target_sz, offsets)
-
-        # response
+        
+        # 获取响应值
         response = F.softmax(out_cls.permute(
             1, 2, 3, 0).contiguous().view(2, -1), dim=0).data[1].cpu().numpy()
+        
+        # 计算惩罚项
+        penalty = self._create_penalty(self.target_sz, offsets)
         response = response * penalty
         response = (1 - self.cfg.window_influence) * response + \
             self.cfg.window_influence * self.hann_window
         
-        # peak location
-        best_id = np.argmax(response)
-        offset = offsets[:, best_id] * self.z_sz / self.cfg.exemplar_sz
-
-        # update center
+        # 获取 top-K 个候选框
+        top_k_ids = np.argsort(response)[-self.top_k:][::-1]
+        top_k_responses = response[top_k_ids]
+        top_k_offsets = offsets[:, top_k_ids]
+        
+        # 如果最佳响应值低于阈值，在历史候选框附近搜索
+        best_id = top_k_ids[0]
+        if response[best_id] < self.response_threshold and len(self.history_candidates) > 0:
+            # 在历史候选框附近扩大搜索范围
+            search_result = self._search_near_history(image)
+            if search_result is not None:
+                best_offset, best_response = search_result
+                if best_response > response[best_id]:
+                    offset = best_offset
+                else:
+                    offset = top_k_offsets[:, 0] * self.z_sz / self.cfg.exemplar_sz
+            else:
+                offset = top_k_offsets[:, 0] * self.z_sz / self.cfg.exemplar_sz
+        else:
+            offset = top_k_offsets[:, 0] * self.z_sz / self.cfg.exemplar_sz
+        
+        # 更新中心位置
         self.center += offset[:2][::-1]
         self.center = np.clip(self.center, 0, image.shape[:2])
-
-        # update scale
+        
+        # 更新尺度
         lr = response[best_id] * self.cfg.lr
         self.target_sz = (1 - lr) * self.target_sz + lr * offset[2:][::-1]
         self.target_sz = np.clip(self.target_sz, 10, image.shape[:2])
-
-        # update exemplar and instance sizes
+        
+        # 更新搜索区域大小
         context = self.cfg.context * np.sum(self.target_sz)
         self.z_sz = np.sqrt(np.prod(self.target_sz + context))
-        self.x_sz = self.z_sz * \
-            self.cfg.instance_sz / self.cfg.exemplar_sz
-
-        # return 1-indexed and left-top based bounding box
-        box = np.array([
+        self.x_sz = self.z_sz * self.cfg.instance_sz / self.cfg.exemplar_sz
+        
+        # 保存当前候选框到历史记录
+        current_box = np.array([
             self.center[1] + 1 - (self.target_sz[1] - 1) / 2,
             self.center[0] + 1 - (self.target_sz[0] - 1) / 2,
             self.target_sz[1], self.target_sz[0]])
+        self._update_history_candidates(current_box, response[best_id])
+    
+        return current_box
+    
+    def _update_history_candidates(self, box, response):
+        """更新历史候选框列表"""
+        self.history_candidates.append({
+            'box': box.copy(),
+            'response': response,
+            'frame': len(self.history_candidates)
+        })
+        # 只保留最近的N帧
+        if len(self.history_candidates) > 30:  # 可以调整历史帧数
+            self.history_candidates.pop(0)
 
-        return box
+    def _search_near_history(self, image):
+        """在历史候选框附近搜索"""
+        best_response = -float('inf')
+        best_offset = None
+        
+        # 遍历最近的历史候选框
+        for candidate in reversed(self.history_candidates[-5:]):  # 只查找最近的5帧
+            # 在候选框附近扩大搜索范围
+            search_center = np.array([
+                candidate['box'][1] + candidate['box'][3]/2,
+                candidate['box'][0] + candidate['box'][2]/2
+            ])
+            
+            # 使用更大的搜索窗口
+            search_size = self.x_sz * self.search_window
+            instance_image = self._crop_and_resize(
+                image, search_center, search_size,
+                self.cfg.instance_sz, self.avg_color)
+            
+            # 执行目标检测
+            instance_image = torch.from_numpy(instance_image).to(
+                self.device).permute(2, 0, 1).unsqueeze(0).float()
+            with torch.set_grad_enabled(False):
+                out_reg, out_cls = self.net.inference(
+                    instance_image, self.kernel_reg, self.kernel_cls)
+            
+            # 计算响应值
+            response = F.softmax(out_cls.permute(
+                1, 2, 3, 0).contiguous().view(2, -1), dim=0).data[1].cpu().numpy()
+            
+            # 如果找到更好的响应，更新结果
+            max_response = np.max(response)
+            if max_response > best_response:
+                best_response = max_response
+                offsets = out_reg.permute(
+                    1, 2, 3, 0).contiguous().view(4, -1).cpu().numpy()
+                best_id = np.argmax(response)
+                best_offset = offsets[:, best_id]
+        
+        return (best_offset, best_response) if best_offset is not None else None
 
     def _create_anchors(self, response_sz):
         anchor_num = len(self.cfg.ratios) * len(self.cfg.scales)
