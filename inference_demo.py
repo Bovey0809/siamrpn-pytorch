@@ -8,6 +8,7 @@ import os
 from PIL import Image
 import time
 from tqdm import tqdm
+import ffmpeg
 
 def track_with_progress(tracker, frames, box, st_progress):
     """Tracking with streamlit progress bar"""
@@ -34,7 +35,7 @@ def track_with_progress(tracker, frames, box, st_progress):
     return boxes, times
 
 def main():
-    st.title("SiamRPN 目标跟踪演示")
+    st.title("单目标跟踪演示")
     
     # 模型加载
     @st.cache_resource
@@ -57,30 +58,57 @@ def main():
     
     if video_file is not None and st.session_state.frames is None:
         with st.spinner("正在读取视频..."):
-            # 保存上传的视频到临时文件
-            tfile = tempfile.NamedTemporaryFile(delete=False)
-            tfile.write(video_file.read())
-            
-            # 读取视频帧
-            cap = cv2.VideoCapture(tfile.name)
-            frames = []
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            progress_bar = st.progress(0)
-            
-            for i in range(total_frames):
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                frames.append(frame)
-                # 更新进度
-                progress_bar.progress((i + 1) / total_frames)
-            
-            cap.release()
-            os.unlink(tfile.name)
-            
-            if len(frames) > 0:
-                st.session_state.frames = frames
-                st.success(f"成功读取 {len(frames)} 帧")
+            try:
+                # 保存上传的视频到临时文件
+                tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+                tfile.write(video_file.getvalue())
+                tfile.flush()
+                tfile.close()
+
+                # 使用 ffmpeg 读取视频信息
+                probe = ffmpeg.probe(tfile.name)
+                video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
+                width = int(video_info['width'])
+                height = int(video_info['height'])
+                total_frames = int(video_info['nb_frames'])
+
+                st.write(f"视频信息: {width}x{height}, {total_frames}帧")
+
+                # 使用 ffmpeg 读取视频帧
+                out, _ = (
+                    ffmpeg
+                    .input(tfile.name)
+                    .output('pipe:', format='rawvideo', pix_fmt='rgb24')
+                    .run(capture_stdout=True)
+                )
+                
+                # 直接使用 RGB 格式的帧
+                frames = []
+                progress_bar = st.progress(0)
+                video_frames = np.frombuffer(out, np.uint8).reshape([-1, height, width, 3])
+                
+                for i, frame in enumerate(video_frames):
+                    # 直接使用 RGB 格式，不需要转换
+                    frames.append(frame)
+                    progress_bar.progress((i + 1) / len(video_frames))
+
+                os.unlink(tfile.name)
+                
+                if len(frames) > 0:
+                    st.session_state.frames = frames
+                    st.success(f"成功读取 {len(frames)} 帧")
+                    
+                    # 显示第一帧
+                    if not st.session_state.roi_selected:
+                        st.image(frames[0], caption="第一帧", use_container_width=True)
+                        st.info("请在图像上框选目标区域")
+                else:
+                    st.error("没有读取到任何帧")
+                    
+            except Exception as e:
+                st.error(f"处理视频时发生错误: {str(e)}")
+                import traceback
+                st.code(traceback.format_exc())
     
     if st.session_state.frames is not None:
         st.write("在图像上拖动鼠标来选择跟踪目标区域")
@@ -170,47 +198,110 @@ def main():
             with col2:
                 # 显示跟踪信息（显示原始尺寸的坐标）
                 st.write("跟踪信息")
-                st.write(f"帧号: {frame_idx + 1}/{len(st.session_state.frames)}")
+                st.write(f"帧: {frame_idx + 1}/{len(st.session_state.frames)}")
                 st.write(f"处理时间: {st.session_state.times[frame_idx]:.3f} 秒")
-                st.write("边界框坐标 (原始尺寸):")
+                st.write("边界坐标 (原始尺寸):")
                 st.write(f"x: {box[0]:.1f}")
                 st.write(f"y: {box[1]:.1f}")
                 st.write(f"宽: {box[2]:.1f}")
                 st.write(f"高: {box[3]:.1f}")
 
-            # 添加视频保存选项
-            if st.button("保存跟踪视频"):
-                with st.spinner("正在生成视频..."):
-                    output_path = "tracking_result.mp4"
-                    height, width = st.session_state.frames[0].shape[:2]
-                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                    out = cv2.VideoWriter(output_path, fourcc, 30.0, (width, height))
+            # 保存处理后的视频
+            if st.session_state.tracking_started and len(st.session_state.frames) > 0:
+                if st.button("保存跟踪结果视频"):
+                    # 使用临时目录来保存视频
+                    temp_dir = tempfile.gettempdir()
+                    output_path = os.path.join(temp_dir, "tracking_result.mp4")
                     
-                    # 添加视频生成进度条
-                    video_progress = st.progress(0)
-                    
-                    for i, frame in enumerate(st.session_state.frames):
-                        box = st.session_state.boxes[i]
-                        frame_with_box = frame.copy()
-                        cv2.rectangle(frame_with_box, 
-                                    (int(box[0]), int(box[1])), 
-                                    (int(box[0] + box[2]), int(box[1] + box[3])), 
-                                    (0, 255, 0), 2)
-                        out.write(frame_with_box)
-                        # 更新进度
-                        video_progress.progress((i + 1) / len(st.session_state.frames))
-                    
-                    out.release()
-                    st.success(f"视频已保存到 {output_path}")
-                    
-                    # 提供下载链接
-                    with open(output_path, 'rb') as f:
-                        st.download_button(
-                            label="下载跟踪结果视频",
-                            data=f,
-                            file_name="tracking_result.mp4",
-                            mime="video/mp4"
-                        )
+                    with st.spinner("正在保存视频..."):
+                        try:
+                            height, width = st.session_state.frames[0].shape[:2]
+                            
+                            # 创建带有跟踪框的帧
+                            tracking_frames = []
+                            for frame, bbox in zip(st.session_state.frames, st.session_state.boxes):
+                                frame_with_box = frame.copy()
+                                if bbox is not None:
+                                    # 绘制跟踪框
+                                    x, y, w, h = [int(v) for v in bbox]
+                                    cv2.rectangle(frame_with_box, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                                tracking_frames.append(frame_with_box)
+                            
+                            # 尝试不同的编码器
+                            try:
+                                fourcc = cv2.VideoWriter_fourcc(*'avc1')
+                            except:
+                                try:
+                                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                                except:
+                                    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+                            
+                            # 创建视频写入器
+                            out = cv2.VideoWriter(
+                                output_path,
+                                fourcc,
+                                30.0,
+                                (width, height),
+                                isColor=True
+                            )
+                            
+                            if not out.isOpened():
+                                # 使用 ffmpeg 写入
+                                frames_array = np.array([cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) for frame in tracking_frames])
+                                
+                                process = (
+                                    ffmpeg
+                                    .input('pipe:', format='rawvideo', pix_fmt='bgr24', s=f'{width}x{height}', r=30)
+                                    .output(output_path, pix_fmt='yuv420p', vcodec='libx264')
+                                    .overwrite_output()
+                                    .run_async(pipe_stdin=True)
+                                )
+                                
+                                for frame in frames_array:
+                                    process.stdin.write(frame.tobytes())
+                                
+                                process.stdin.close()
+                                process.wait()
+                                
+                            else:
+                                # 使用 OpenCV 写入
+                                for frame in tracking_frames:
+                                    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                                    out.write(frame_bgr)
+                                out.release()
+                            
+                            # 检查文件是否成功创建
+                            if not os.path.exists(output_path):
+                                raise Exception("视频文件未能成功创建")
+                            
+                            # 提供下载链接
+                            with open(output_path, 'rb') as f:
+                                video_bytes = f.read()
+                            
+                            st.download_button(
+                                label="下载跟踪结果视频",
+                                data=video_bytes,
+                                file_name="tracking_result.mp4",
+                                mime="video/mp4"
+                            )
+                            
+                            st.success(f"视频已保存并准备下载")
+                            
+                        except Exception as e:
+                            st.error(f"保存视频时发生错误: {str(e)}")
+                            import traceback
+                            st.code(traceback.format_exc())
+                        finally:
+                            try:
+                                if os.path.exists(output_path):
+                                    os.remove(output_path)
+                            except Exception as e:
+                                st.warning(f"清理临时文件时发生错误: {str(e)}")
+
+                            # 添加调试信息
+                            st.write(f"临时目录路径: {temp_dir}")
+                            st.write(f"输出文件路径: {output_path}")
+                            st.write(f"当前工作目录: {os.getcwd()}")
 
 if __name__ == "__main__":
     main()

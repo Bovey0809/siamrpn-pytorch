@@ -151,7 +151,9 @@ class TrackerSiamRPN(Tracker):
         self.net = SiamRPN()
         if net_path is not None:
             self.net.load_state_dict(torch.load(
-                net_path, map_location=lambda storage, loc: storage))
+                net_path, 
+                map_location=lambda storage, loc: storage,
+                weights_only=True))
         self.net = self.net.to(self.device)
 
         # 新增参数
